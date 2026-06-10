@@ -49,7 +49,7 @@ extension QUICEndpoint {
         // Create socket with a random local port, using configured buffer sizes
         let socketConfig = configuration.socketConfiguration
         let udpConfig = UDPConfiguration(
-            bindAddress: .specific(host: "0.0.0.0", port: 0),
+            bindAddress: .specific(host: address.ipAddress.contains(":") ? "::" : "0.0.0.0", port: 0),  // bind in the target family (IPv6-only servers)
             reuseAddress: false,
             receiveBufferSize: socketConfig.receiveBufferSize ?? 65536,
             sendBufferSize: socketConfig.sendBufferSize ?? 65536,
