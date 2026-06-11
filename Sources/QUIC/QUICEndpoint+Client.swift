@@ -12,73 +12,6 @@ import QUICCrypto
 import QUICConnection
 @_exported import QUICTransport
 import NIOUDPTransport
-#if canImport(Darwin)
-import Darwin
-#elseif canImport(Glibc)
-import Glibc
-#endif
-
-/// Learn the route-correct local source address for `targetIP` the way a
-/// connected socket (TCP / URLSession) does: open a throwaway connected UDP
-/// socket, let the kernel run route + source-address selection, read it back
-/// with `getsockname()`, and discard the socket. No packets are sent.
-///
-/// Why: an unconnected, wildcard-bound (`::` / `0.0.0.0`) UDP socket defers
-/// source selection to per-packet send time. On a multi-homed host — notably
-/// the iOS Simulator, which bridges `en0` while a destination's route may be
-/// scoped to another interface (`en7`) — that selection picks the wrong source
-/// and the QUIC Initials never get a reply (handshakeTimeout). Binding the real
-/// socket to the source a *connected* probe resolves makes the unconnected
-/// socket egress correctly. Returns nil if the probe fails, so the caller falls
-/// back to the wildcard and single-homed hosts see identical behavior.
-func routeCorrectSourceAddress(targetIP: String, targetPort: UInt16, isIPv6: Bool) -> String? {
-    let fd = socket(isIPv6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0)
-    guard fd >= 0 else { return nil }
-    defer { close(fd) }
-    let port = targetPort.bigEndian
-
-    if isIPv6 {
-        var dst = sockaddr_in6()
-        dst.sin6_family = sa_family_t(AF_INET6)
-        dst.sin6_port = port
-        guard inet_pton(AF_INET6, targetIP, &dst.sin6_addr) == 1 else { return nil }
-        let connected = withUnsafePointer(to: &dst) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
-            }
-        }
-        guard connected == 0 else { return nil }
-        var src = sockaddr_in6()
-        var len = socklen_t(MemoryLayout<sockaddr_in6>.size)
-        let named = withUnsafeMutablePointer(to: &src) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
-        }
-        guard named == 0 else { return nil }
-        var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
-        guard inet_ntop(AF_INET6, &src.sin6_addr, &buf, socklen_t(buf.count)) != nil else { return nil }
-        return String(cString: buf)
-    } else {
-        var dst = sockaddr_in()
-        dst.sin_family = sa_family_t(AF_INET)
-        dst.sin_port = port
-        guard inet_pton(AF_INET, targetIP, &dst.sin_addr) == 1 else { return nil }
-        let connected = withUnsafePointer(to: &dst) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard connected == 0 else { return nil }
-        var src = sockaddr_in()
-        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let named = withUnsafeMutablePointer(to: &src) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
-        }
-        guard named == 0 else { return nil }
-        var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-        guard inet_ntop(AF_INET, &src.sin_addr, &buf, socklen_t(buf.count)) != nil else { return nil }
-        return String(cString: buf)
-    }
-}
 
 // MARK: - Client API
 
@@ -115,17 +48,8 @@ extension QUICEndpoint {
 
         // Create socket with a random local port, using configured buffer sizes
         let socketConfig = configuration.socketConfiguration
-        let isV6 = address.ipAddress.contains(":")
-        // Bind to the route-correct source the kernel would pick for a *connected*
-        // socket (see routeCorrectSourceAddress). On single-homed hosts this equals
-        // the address an unconnected wildcard socket would have used, so behavior is
-        // unchanged; on multi-homed hosts / the iOS Simulator it fixes the source
-        // selection that otherwise drops the QUIC Initials (handshakeTimeout). Falls
-        // back to the wildcard in the target family if the probe fails.
-        let bindHost = routeCorrectSourceAddress(targetIP: address.ipAddress, targetPort: address.port, isIPv6: isV6)
-            ?? (isV6 ? "::" : "0.0.0.0")
         let udpConfig = UDPConfiguration(
-            bindAddress: .specific(host: bindHost, port: 0),  // bind in the target family (IPv6-only servers)
+            bindAddress: .specific(host: address.ipAddress.contains(":") ? "::" : "0.0.0.0", port: 0),  // bind in the target family (IPv6-only servers)
             reuseAddress: false,
             receiveBufferSize: socketConfig.receiveBufferSize ?? 65536,
             sendBufferSize: socketConfig.sendBufferSize ?? 65536,
@@ -141,7 +65,15 @@ extension QUICEndpoint {
             enableECN: socketConfig.enableECN,
             enableDF: socketConfig.enableDF
         )
-        let socket = NIOQUICSocket(configuration: udpConfig, platformOptions: platformOpts)
+        #if canImport(Network)
+        // Apple platforms (iOS especially): a raw NIOPosix UDP socket does not
+        // transmit — iOS only routes UDP through a Network.framework NECP flow.
+        // Ride NWConnection instead; Quiver's QUIC stack is unchanged on top.
+        let socket: any QUICSocket = NWConnectionQUICSocket(remote: try address.toNIOAddress())
+        _ = (udpConfig, platformOpts)  // NIO-path inputs, unused on the NW path
+        #else
+        let socket: any QUICSocket = NIOQUICSocket(configuration: udpConfig, platformOptions: platformOpts)
+        #endif
         try await socket.start()
 
         // Set socket directly before running to avoid race condition

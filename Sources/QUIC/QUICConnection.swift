@@ -225,16 +225,17 @@ import NIOCore
 extension SocketAddress {
     /// Creates a SocketAddress from a NIOCore.SocketAddress
     public init?(_ nioAddress: NIOCore.SocketAddress) {
-        guard let port = nioAddress.port else {
+        // Format the numeric address from the sockaddr via `.ipAddress`, NOT the
+        // `.host` field: NIO leaves `.host` empty for addresses built with
+        // `SocketAddress(ipAddress:port:)` and for peers received off the wire,
+        // which would yield an unparseable "" host downstream.
+        guard let port = nioAddress.port, let ip = nioAddress.ipAddress else {
             return nil
         }
 
         switch nioAddress {
-        case .v4(let addr):
-            self.ipAddress = addr.host
-            self.port = UInt16(port)
-        case .v6(let addr):
-            self.ipAddress = addr.host
+        case .v4, .v6:
+            self.ipAddress = ip
             self.port = UInt16(port)
         case .unixDomainSocket:
             return nil
