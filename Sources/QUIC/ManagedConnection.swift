@@ -1065,6 +1065,13 @@ public final class ManagedConnection: Sendable {
                 }
             }
             return try generateOutboundPackets()
+
+        case .sendAck:
+            // The ACK-delay timer fired. generateOutboundPackets() emits the
+            // pending ACK (getOutboundPackets → generateAckFrame), which resets
+            // the ack alarm — so the next nextTimerDeadline() no longer reports a
+            // past ACK deadline and the timer loop stops spinning.
+            return try generateOutboundPackets()
         }
     }
 

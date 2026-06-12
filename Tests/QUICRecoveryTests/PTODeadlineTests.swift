@@ -42,7 +42,25 @@ struct PTODeadlineTests {
         // RFC 9002 §6.2.1: deadline == t0 + PTO, which by `later` has long
         // elapsed → a probe is overdue. The bug returns `later + PTO` (always
         // in the future) → the probe never fires.
-        #expect(deadline <= later,
+        #expect(deadline != nil,
+            "PTO must be armed while an ack-eliciting packet is in flight")
+        #expect(deadline! <= later,
             "PTO must anchor to the last ack-eliciting send time (t0 + PTO), not now + PTO")
+    }
+
+    @Test("PTO is NOT armed when the handshake is confirmed and nothing is in flight")
+    func ptoNotArmedWhenIdleAndConfirmed() {
+        // RFC 9002 §6.2.1: with no ack-eliciting packets in flight and the
+        // handshake confirmed, the PTO timer is not armed. The old code returned
+        // `now + PTO` unconditionally, so `nextTimerDeadline()` always reported a
+        // near-future PTO deadline and the timer loop woke every PTO interval to
+        // do nothing — a needless periodic tick on an idle, established
+        // connection. nil here is what lets the loop sleep until the idle-timeout.
+        let mgr = PacketNumberSpaceManager()
+        mgr.handshakeConfirmed = true   // established connection
+
+        // No packets sent → nothing ack-eliciting in flight.
+        #expect(mgr.nextPTODeadline(now: .now) == nil,
+            "an idle, handshake-confirmed connection must not arm the PTO")
     }
 }

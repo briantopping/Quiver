@@ -206,13 +206,23 @@ package final class PacketNumberSpaceManager: Sendable {
     /// receding horizon that never elapses, so the probe never fires and a lost
     /// packet is never retransmitted (the connection dies on the FIRST loss —
     /// e.g. a dropped Initial). When nothing ack-eliciting is in flight the PTO
-    /// is not armed; we anchor to `now` so the returned deadline (`now + PTO`)
-    /// stays in the future and a `deadline <= now` caller never spuriously
-    /// probes an idle path.
+    /// is not armed: we return `nil`. An always-armed PTO (the old `now + PTO`
+    /// fallback) makes an idle, established connection's timer loop wake every
+    /// PTO interval forever to do nothing — a needless periodic tick on top of
+    /// the (separately-fixed) `<= now` busy-spin.
     ///
     /// - Parameter now: Current time
-    /// - Returns: The PTO deadline
-    package func nextPTODeadline(now: ContinuousClock.Instant) -> ContinuousClock.Instant {
+    /// - Returns: The PTO deadline, or `nil` when the PTO is not armed (RFC 9002
+    ///   §6.2.1: no ack-eliciting packets in flight and the handshake is
+    ///   confirmed — the §6.2.2.1 anti-deadlock case keeps it armed during an
+    ///   unconfirmed handshake).
+    package func nextPTODeadline(now: ContinuousClock.Instant) -> ContinuousClock.Instant? {
+        // RFC 9002 §6.2.1 / §6.2.2.1: arm the PTO only when ack-eliciting packets
+        // are in flight, OR the handshake is not yet confirmed (anti-deadlock).
+        guard hasAckElicitingInFlight || needsPTOProbeEvenWithoutInFlight else {
+            return nil
+        }
+
         let maxDelay = effectiveMaxAckDelay
 
         let pto = _rttEstimator.withLock { rtt in

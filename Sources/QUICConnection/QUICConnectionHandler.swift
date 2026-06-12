@@ -449,11 +449,19 @@ package final class QUICConnectionHandler: Sendable {
             }
         }
 
-        // Check for PTO (uses internally managed peerMaxAckDelay)
-        let ptoDeadline = pnSpaceManager.nextPTODeadline(now: now)
-        if ptoDeadline <= now {
+        // Check for PTO (uses internally managed peerMaxAckDelay). nil = not
+        // armed (RFC 9002: nothing in flight + handshake confirmed) → no probe.
+        if let ptoDeadline = pnSpaceManager.nextPTODeadline(now: now), ptoDeadline <= now {
             pnSpaceManager.onPTOExpired()
             return .probe
+        }
+
+        // Check for a due ACK-delay timer. `nextTimerDeadline()` advertises the
+        // ACK deadline, so the loop MUST act on it: flush the pending ACK (which
+        // resets the ack alarm in AckManager.generateAckFrame). Without this the
+        // ack deadline stays `<= now` and `timerProcessingLoop` busy-spins.
+        if let ackTime = pnSpaceManager.earliestAckTime()?.time, ackTime <= now {
+            return .sendAck
         }
 
         return .none
@@ -473,11 +481,15 @@ package final class QUICConnectionHandler: Sendable {
         // Get ACK time
         let ackTime = pnSpaceManager.earliestAckTime()?.time
 
-        // Get pacing time (for smooth transmission)
-        let pacingTime = congestionController.nextSendTime()
+        // NOTE: pacing time (congestionController.nextSendTime()) is deliberately
+        // NOT included. Pacing gates the SEND path (`canSendPacket`); it is not a
+        // recovery wakeup, and `onTimerExpired` has no pacing action — so a past
+        // pacing deadline here would make `timerProcessingLoop` busy-spin (wake,
+        // do nothing about pacing, recompute the same past deadline). A paced-send
+        // resume, if ever needed, belongs to the outbound loop, not this timer.
 
-        // Return earliest
-        return [lossTime, ptoTime, ackTime, pacingTime].compactMap { $0 }.min()
+        // Return earliest of the timers this loop can actually act on.
+        return [lossTime, ptoTime, ackTime].compactMap { $0 }.min()
     }
 
     // MARK: - Congestion Control
