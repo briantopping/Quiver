@@ -906,28 +906,32 @@ public actor WebTransportSession {
         )
 
         var receivedFIN = false
+        var readCount = 0
 
         while state == .established || state == .draining {
             let data: Data
             do {
                 data = try await connectStream.read()
             } catch {
-                Self.logger.trace(
-                    "CONNECT stream read error (session may be closing): \(error)",
+                Self.logger.info(
+                    "DIAGCAP CONNECT stream read error after \(readCount) reads (session closing): \(error)",
                     metadata: ["sessionID": "\(sessionID)"]
                 )
                 break
             }
+            readCount += 1
 
             if data.isEmpty {
                 // FIN received on CONNECT stream — session is ending
-                Self.logger.debug(
-                    "CONNECT stream FIN received",
+                Self.logger.info(
+                    "DIAGCAP CONNECT stream FIN received (read #\(readCount))",
                     metadata: ["sessionID": "\(sessionID)"]
                 )
                 receivedFIN = true
                 break
             }
+            Self.logger.info("DIAGCAP CONNECT read #\(readCount): \(data.count) bytes",
+                metadata: ["sessionID": "\(sessionID)"])
 
             capsuleBuffer.append(data)
 
