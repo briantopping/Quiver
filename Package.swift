@@ -289,6 +289,7 @@ let package = Package(
                 "QUIC",
                 "QPACK",
                 "QUICCore",
+                "QUICCrypto",
                 "QUICStream",
                 "QuiverTestSupport",
             ],
