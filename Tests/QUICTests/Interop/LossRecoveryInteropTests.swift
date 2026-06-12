@@ -73,6 +73,8 @@ final class ImpairingRelay: @unchecked Sendable {
         forwardingTo serverPort: Int,
         lossProbability: Double = 0,
         dropFirstEachDirection: Int = 0,
+        reorderProbability: Double = 0,
+        reorderDelayMs: Int = 12,
         seed: UInt64 = 0xC0FFEE
     ) async throws -> ImpairingRelay {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
@@ -81,6 +83,8 @@ final class ImpairingRelay: @unchecked Sendable {
             serverAddr: serverAddr,
             lossProbability: lossProbability,
             dropFirstEachDirection: dropFirstEachDirection,
+            reorderProbability: reorderProbability,
+            reorderDelay: .milliseconds(Int64(reorderDelayMs)),
             seed: seed
         )
         do {
@@ -111,6 +115,8 @@ private final class RelayHandler: ChannelInboundHandler, @unchecked Sendable {
 
     private let serverAddr: NIOCore.SocketAddress
     private let lossProbability: Double
+    private let reorderProbability: Double
+    private let reorderDelay: TimeAmount
     private let lock = NSLock()
 
     // lock-guarded
@@ -120,9 +126,12 @@ private final class RelayHandler: ChannelInboundHandler, @unchecked Sendable {
     private var stats = ImpairingRelay.Stats()
     private var rngState: UInt64
 
-    init(serverAddr: NIOCore.SocketAddress, lossProbability: Double, dropFirstEachDirection: Int, seed: UInt64) {
+    init(serverAddr: NIOCore.SocketAddress, lossProbability: Double, dropFirstEachDirection: Int,
+         reorderProbability: Double, reorderDelay: TimeAmount, seed: UInt64) {
         self.serverAddr = serverAddr
         self.lossProbability = lossProbability
+        self.reorderProbability = reorderProbability
+        self.reorderDelay = reorderDelay
         self.dropC2SRemaining = dropFirstEachDirection
         self.dropS2CRemaining = dropFirstEachDirection
         self.rngState = seed
@@ -144,8 +153,10 @@ private final class RelayHandler: ChannelInboundHandler, @unchecked Sendable {
         let envelope = unwrapInboundIn(data)
         let fromServer = (envelope.remoteAddress == serverAddr)
 
-        // Returns the address to forward to, or nil to drop this datagram.
-        let destination: NIOCore.SocketAddress? = lock.withLock {
+        // Returns (address to forward to, whether to delay it for reordering),
+        // or nil destination to drop this datagram.
+        let decision: (dest: NIOCore.SocketAddress, reorder: Bool)? = lock.withLock {
+            let dest: NIOCore.SocketAddress
             if fromServer {
                 guard let client = clientAddr else { return nil } // nowhere to send yet
                 if dropS2CRemaining > 0 { dropS2CRemaining -= 1; stats.dropped += 1; return nil }
@@ -153,7 +164,7 @@ private final class RelayHandler: ChannelInboundHandler, @unchecked Sendable {
                     stats.dropped += 1; return nil
                 }
                 stats.s2c += 1
-                return client
+                dest = client
             } else {
                 clientAddr = envelope.remoteAddress
                 if dropC2SRemaining > 0 { dropC2SRemaining -= 1; stats.dropped += 1; return nil }
@@ -161,13 +172,25 @@ private final class RelayHandler: ChannelInboundHandler, @unchecked Sendable {
                     stats.dropped += 1; return nil
                 }
                 stats.c2s += 1
-                return serverAddr
+                dest = serverAddr
             }
+            // Delay a fraction of forwarded datagrams so later ones overtake them
+            // (injects reordering, distinct from pure loss).
+            let reorder = reorderProbability > 0 && nextUnitInterval() < reorderProbability
+            return (dest, reorder)
         }
 
-        guard let destination else { return }
-        let out = AddressedEnvelope(remoteAddress: destination, data: envelope.data)
-        context.writeAndFlush(wrapOutboundOut(out), promise: nil)
+        guard let decision else { return }
+        let out = wrapOutboundOut(AddressedEnvelope(remoteAddress: decision.dest, data: envelope.data))
+        if decision.reorder {
+            // Hold this datagram briefly; subsequent ones flushed immediately pass it.
+            let channel = context.channel
+            context.eventLoop.scheduleTask(in: reorderDelay) {
+                channel.writeAndFlush(out, promise: nil)
+            }
+        } else {
+            context.writeAndFlush(out, promise: nil)
+        }
     }
 }
 
@@ -182,6 +205,7 @@ struct LossRecoveryInteropTests {
     private func runEcho(
         lossProbability: Double = 0,
         dropFirstEachDirection: Int = 0,
+        reorderProbability: Double = 0,
         seed: UInt64 = 0xC0FFEE,
         message: String = "loss-recovery echo over a lossy path",
         payloadBytes: Int? = nil
@@ -202,6 +226,7 @@ struct LossRecoveryInteropTests {
             forwardingTo: Int(serverPort),
             lossProbability: lossProbability,
             dropFirstEachDirection: dropFirstEachDirection,
+            reorderProbability: reorderProbability,
             seed: seed
         )
 
@@ -282,19 +307,42 @@ struct LossRecoveryInteropTests {
     // used `gap + 1` vs RFC 9000 §19.3.1's `gap + 2`): under sustained mid-stream
     // loss the sender SPURIOUSLY ACKed an unreceived (lost) packet — the first
     // packet of each ACK gap — dropped it from tracking, and never retransmitted
-    // it, permanently stalling the stream. Before the fix this seed stalled at
+    // it, permanently stalling the stream. Before the fix, seed 0x1 stalled at
     // 2332/8000; it now round-trips an 8 KB multi-packet stream under heavy loss.
-    // Several seeds at 12%, each deterministic, exercise different gap patterns.
-    @Test("recovers an 8 KB stream under sustained 12% loss across seeds (gap-decode regression)",
+    //
+    // Gated at 20% per-datagram loss across several deterministic seeds (each
+    // exercises a different gap pattern). 20% is well above realistic mobile loss
+    // (cellular 1–10%, wifi 0.5–5%); an empirical sweep showed clean recovery all
+    // the way to 30% — i.e. the off-by-one WAS the "30%+ brutal tail" noted when
+    // the engine was first wired (4c43393).
+    @Test("recovers an 8 KB stream under sustained 20% loss across seeds (gap-decode regression)",
           .timeLimit(.minutes(2)),
           arguments: [UInt64(0x1), 0x2, 0xA11CE, 0xC0FFEE])
     func recoversUnderSustainedLoss(seed: UInt64) async throws {
         let (matched, stats) = try await runEcho(
-            lossProbability: 0.12,
+            lossProbability: 0.20,
             seed: seed,
             payloadBytes: 8000
         )
-        #expect(matched, "the full 8 KB stream must round-trip under 12% sustained loss (seed \(seed))")
-        #expect(stats.dropped >= 1, "12% over a multi-packet echo must inject real loss (seed \(seed))")
+        #expect(matched, "the full 8 KB stream must round-trip under 20% sustained loss (seed \(seed))")
+        #expect(stats.dropped >= 2, "20% over a multi-packet echo must inject real loss (seed \(seed))")
+    }
+
+    @Test("recovers an 8 KB stream under combined 10% loss + 20% reordering",
+          .timeLimit(.minutes(2)),
+          arguments: [UInt64(0x1), 0x2, 0xA11CE, 0xC0FFEE])
+    func recoversUnderLossAndReordering(seed: UInt64) async throws {
+        // Reordering (delay a fraction of datagrams so later ones overtake them)
+        // is a distinct fault from pure loss: it stresses packet-threshold loss
+        // detection (out-of-order ACKs / spurious-loss avoidance) and stream
+        // reassembly differently. Combined with 10% loss over a multi-packet echo.
+        let (matched, stats) = try await runEcho(
+            lossProbability: 0.10,
+            reorderProbability: 0.20,
+            seed: seed,
+            payloadBytes: 8000
+        )
+        #expect(matched, "the full 8 KB stream must round-trip under loss + reordering (seed \(seed))")
+        #expect(stats.dropped >= 1, "loss must be injected (seed \(seed))")
     }
 }
