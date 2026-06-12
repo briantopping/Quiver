@@ -254,7 +254,7 @@ extension QUICConnectionHandler {
             // detected loss silently drops data and the stream/handshake stalls.
             for lost in result.lostPackets {
                 for frame in lost.frames {
-                    queueFrame(frame, level: lost.encryptionLevel)
+                    queueFrameIfAbsent(frame, level: lost.encryptionLevel)
                 }
             }
         }

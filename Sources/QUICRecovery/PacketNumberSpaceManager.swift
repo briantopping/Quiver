@@ -343,7 +343,14 @@ package final class PacketNumberSpaceManager: Sendable {
             )
         }
 
-        // Reset PTO count on valid ACK
+        // RFC 9002 §A.7 (OnAckReceived): reset the PTO backoff count whenever this
+        // ACK *newly acknowledges* any packet (the pseudocode returns early on an
+        // empty newly-acked set, then unconditionally sets `pto_count = 0` once the
+        // peer's address is validated). The ack-eliciting condition in §A.7 gates
+        // the RTT *sample*, NOT the pto_count reset — tying the reset to
+        // ack-eliciting acks makes pto_count run away under sustained loss (when
+        // the only returning acks are for our pure-ACK packets), so the PTO backs
+        // off 1→2→4→8→16s and the connection idle-closes mid-stream.
         if !result.ackedPackets.isEmpty {
             resetPTOCount()
         }

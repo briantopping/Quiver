@@ -239,6 +239,12 @@ let package = Package(
         ),
 
         .testTarget(
+            name: "QUICConnectionTests",
+            dependencies: ["QUICConnection", "QUICCore"],
+            path: "Tests/QUICConnectionTests"
+        ),
+
+        .testTarget(
             name: "QUICStreamTests",
             dependencies: ["QUICStream", "QUICCore"],
             path: "Tests/QUICStreamTests"
@@ -251,6 +257,8 @@ let package = Package(
                 "QUICRecovery",
                 "QUICTransport",
                 "QuiverTestSupport",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
             ],
             path: "Tests/QUICTests"
         ),

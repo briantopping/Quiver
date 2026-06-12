@@ -1040,7 +1040,7 @@ public final class ManagedConnection: Sendable {
             var requeued = false
             for lost in lostPackets {
                 for frame in lost.frames {
-                    handler.queueFrame(frame, level: lost.encryptionLevel)
+                    handler.queueFrameIfAbsent(frame, level: lost.encryptionLevel)
                     requeued = true
                 }
             }
@@ -1061,7 +1061,7 @@ public final class ManagedConnection: Sendable {
                 handler.queueFrame(.ping, level: level)
             } else {
                 for item in probes {
-                    handler.queueFrame(item.frame, level: item.level)
+                    handler.queueFrameIfAbsent(item.frame, level: item.level)
                 }
             }
             return try generateOutboundPackets()

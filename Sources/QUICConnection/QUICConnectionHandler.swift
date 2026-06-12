@@ -368,6 +368,26 @@ package final class QUICConnectionHandler: Sendable {
         outboundQueue.withLock { $0.append(packet) }
     }
 
+    /// Queues a frame for retransmission only if an identical frame is not
+    /// already pending at the same encryption level.
+    ///
+    /// RFC 9002 §6.2.4: a PTO probe is a pure read of the oldest unacked frames
+    /// and does NOT consume them from the sent-packet record, so a later
+    /// loss-detection pass (or a second probe) can resurface the same frame.
+    /// Re-queuing it blindly would put duplicate copies on the wire — harmless
+    /// to correctness (retransmission is idempotent) but wasteful of the
+    /// congestion window. This collapses those duplicates at the queue.
+    package func queueFrameIfAbsent(_ frame: Frame, level: EncryptionLevel) {
+        outboundQueue.withLock { queue in
+            let alreadyQueued = queue.contains {
+                $0.level == level && $0.frames.contains(frame)
+            }
+            if !alreadyQueued {
+                queue.append(OutboundPacket(frames: [frame], level: level))
+            }
+        }
+    }
+
     /// Queues CRYPTO frames to be sent
     ///
     /// Phase 4: Subtract worst-case long-header overhead so each CRYPTO frame
