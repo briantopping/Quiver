@@ -158,9 +158,57 @@ package final class PacketNumberSpaceManager: Sendable {
         ackManagers[level]?.clear()
     }
 
+    /// The send time of the most recent ack-eliciting packet still in flight,
+    /// across all packet-number spaces — RFC 9002's `time_of_last_ack_eliciting_packet`.
+    ///
+    /// The PTO timer is anchored to this instant. Returns `nil` when no
+    /// ack-eliciting packet is in flight (the PTO is not armed).
+    ///
+    /// - Returns: The latest in-flight ack-eliciting send time, or nil if none.
+    package func timeOfLastAckElicitingPacket() -> ContinuousClock.Instant? {
+        var latest: ContinuousClock.Instant? = nil
+        for level in [EncryptionLevel.initial, .handshake, .application] {
+            guard let detector = lossDetectors[level], detector.ackElicitingInFlight > 0 else {
+                continue
+            }
+            for packet in detector.getRetransmittablePackets() where latest == nil || packet.timeSent > latest! {
+                latest = packet.timeSent
+            }
+        }
+        return latest
+    }
+
+    /// The retransmittable frames of the oldest unacked ack-eliciting packet in
+    /// each space — RFC 9002 §6.2.4's "send new or unacked data" on a PTO probe.
+    /// Lets a TAIL-lost packet (one with no following ACK to declare it lost,
+    /// e.g. a dropped Initial) get its data re-sent instead of a content-free
+    /// PING. Empty when nothing ack-eliciting is unacked.
+    package func oldestUnackedRetransmittableFrames() -> [(frame: Frame, level: EncryptionLevel)] {
+        var out: [(frame: Frame, level: EncryptionLevel)] = []
+        for level in [EncryptionLevel.initial, .handshake, .application] {
+            guard let detector = lossDetectors[level] else { continue }
+            for packet in detector.getOldestUnackedPackets(count: 1) {
+                for frame in packet.frames {
+                    out.append((frame: frame, level: level))
+                }
+            }
+        }
+        return out
+    }
+
     /// Calculates the next PTO deadline
     ///
     /// Uses the internally managed `peerMaxAckDelay` value.
+    ///
+    /// RFC 9002 §6.2.1: the PTO deadline is anchored to the time the LAST
+    /// ack-eliciting packet was sent — `time_of_last_ack_eliciting_packet + PTO`
+    /// — NOT to `now`. Anchoring to `now` makes the deadline a perpetually-
+    /// receding horizon that never elapses, so the probe never fires and a lost
+    /// packet is never retransmitted (the connection dies on the FIRST loss —
+    /// e.g. a dropped Initial). When nothing ack-eliciting is in flight the PTO
+    /// is not armed; we anchor to `now` so the returned deadline (`now + PTO`)
+    /// stays in the future and a `deadline <= now` caller never spuriously
+    /// probes an idle path.
     ///
     /// - Parameter now: Current time
     /// - Returns: The PTO deadline
@@ -172,7 +220,8 @@ package final class PacketNumberSpaceManager: Sendable {
         }
 
         let ptoMultiplier = _ptoCount.withLock { 1 << $0 }  // 2^pto_count
-        return now + (pto * ptoMultiplier)
+        let anchor = timeOfLastAckElicitingPacket() ?? now
+        return anchor + (pto * ptoMultiplier)
     }
 
     /// Increments PTO count on timeout

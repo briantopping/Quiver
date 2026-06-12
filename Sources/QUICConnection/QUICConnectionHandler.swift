@@ -396,6 +396,12 @@ package final class QUICConnectionHandler: Sendable {
         )
     }
 
+    /// Frames to send as a PTO probe (RFC 9002 §6.2.4): the oldest unacked data,
+    /// re-sent so a tail-lost packet still makes progress. Empty ⇒ send a PING.
+    package func probeRetransmissions() -> [(frame: Frame, level: EncryptionLevel)] {
+        pnSpaceManager.oldestUnackedRetransmittableFrames()
+    }
+
     /// Gets the next packet number for an encryption level
     /// - Parameter level: The encryption level
     /// - Returns: The next packet number
