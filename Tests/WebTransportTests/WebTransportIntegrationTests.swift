@@ -399,14 +399,19 @@ final class WebTransportEndToEndTests: XCTestCase {
         let underlyingStream = opened.last!
         let writtenFraming = underlyingStream.allWrittenData
 
-        // The first bytes should be the session ID varint
+        // The framing is the WEBTRANSPORT_STREAM bidi signal (0x41) followed by
+        // the session ID varint (draft-ietf-webtrans-http3).
         XCTAssertFalse(writtenFraming.isEmpty, "Session ID framing should have been written")
 
-        // Decode the session ID from the written framing
-        let (decodedVarint, _) = try Varint.decode(from: writtenFraming)
+        // First varint is the 0x41 bidi signal value.
+        let (typeVarint, typeConsumed) = try Varint.decode(from: writtenFraming)
+        XCTAssertEqual(typeVarint.value, 0x41, "Bidi stream must lead with the 0x41 signal value")
+
+        // Second varint is the session ID.
+        let (decodedVarint, _) = try Varint.decode(from: Data(writtenFraming.dropFirst(typeConsumed)))
         let sessionID = await session.sessionID
         XCTAssertEqual(decodedVarint.value, sessionID,
-                        "Written framing should contain the session ID")
+                        "Written framing should contain the session ID after the 0x41 prefix")
 
         // Write application data on the WT stream
         let testPayload = Data("Hello, WebTransport!".utf8)
@@ -2036,7 +2041,9 @@ final class WebTransportBrowserInteropTests: XCTestCase {
         XCTAssertFalse(WebTransportStreamClassification.isWebTransportStream(0x03)) // QPACK decoder
     }
 
-    /// Verifies bidirectional stream framing (session ID as first varint)
+    /// Verifies bidirectional stream framing: WEBTRANSPORT_STREAM bidi signal
+    /// (0x41) followed by the session ID (draft-ietf-webtrans-http3, the framing
+    /// Chrome emits and strict servers require).
     func testBidiStreamFramingWireFormat() async throws {
         let stream = MockIntegrationStream(id: 100)
 
@@ -2044,9 +2051,11 @@ final class WebTransportBrowserInteropTests: XCTestCase {
         try await WebTransportStreamFraming.writeBidirectionalHeader(to: stream, sessionID: 4)
 
         let written = stream.allWrittenData
-        // Session ID 4 as varint = single byte 0x04
-        XCTAssertEqual(written.count, 1)
-        XCTAssertEqual(written[0], 0x04)
+        // Signal value 0x41 = 65 decimal, which exceeds 1-byte varint range
+        // (0-63), so it encodes as a 2-byte varint (2MSB=01): [0x40, 0x41].
+        // Session ID 4 encodes as 1-byte varint: [0x04]. Total = 3 bytes.
+        XCTAssertEqual(written.count, 3)
+        XCTAssertEqual(Array(written), [0x40, 0x41, 0x04])
     }
 
     /// Verifies unidirectional stream framing (stream type 0x54 + session ID)

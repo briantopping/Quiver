@@ -711,8 +711,21 @@ final class WebTransportStreamFramingTests: XCTestCase {
         XCTAssertEqual(kWebTransportUniStreamType, 0x54)
     }
 
+    func testWebTransportBidiStreamType() {
+        XCTAssertEqual(kWebTransportBidiStreamType, 0x41)
+    }
+
     // MARK: - Bidirectional Stream Framing
 
+    /// A client-initiated WebTransport bidirectional stream MUST begin with the
+    /// WEBTRANSPORT_STREAM signal value 0x41 followed by the session ID varint
+    /// (draft-ietf-webtrans-http3, the framing Chrome and other browsers send).
+    ///
+    /// Regression guard for the on-device interop bug: Quiver previously wrote a
+    /// bare session-ID varint (draft-02). For sessionID 0 that is the single byte
+    /// 0x00, which a strict server reads as "unknown bidi frame type 0" and the
+    /// connection is torn down (surfacing on the client as
+    /// H3_CLOSED_CRITICAL_STREAM right after CONNECT returned 200).
     func testWriteBidirectionalHeader() async throws {
         let stream = MockWTStream(id: 0)
         try await WebTransportStreamFraming.writeBidirectionalHeader(to: stream, sessionID: 4)
@@ -720,9 +733,33 @@ final class WebTransportStreamFramingTests: XCTestCase {
         let written = stream.allWrittenData
         XCTAssertFalse(written.isEmpty)
 
-        // Decode the session ID varint
-        let (varint, _) = try Varint.decode(from: written)
-        XCTAssertEqual(varint.value, 4)
+        // First varint MUST be the WEBTRANSPORT_STREAM bidi signal value 0x41.
+        let (typeVarint, typeConsumed) = try Varint.decode(from: written)
+        XCTAssertEqual(typeVarint.value, 0x41, "bidi stream must be prefixed with 0x41")
+
+        // Second varint is the session ID.
+        let remaining = Data(written.dropFirst(typeConsumed))
+        let (sessionVarint, _) = try Varint.decode(from: remaining)
+        XCTAssertEqual(sessionVarint.value, 4)
+    }
+
+    /// Session ID 0 is the worst case: a bare-session-ID writer emits the single
+    /// byte 0x00, which is the H3 DATA frame type — exactly the "unknown bidi
+    /// frame type 0" the production server rejected. The 0x41 prefix removes the
+    /// ambiguity.
+    func testWriteBidirectionalHeaderSessionIDZero() async throws {
+        let stream = MockWTStream(id: 0)
+        try await WebTransportStreamFraming.writeBidirectionalHeader(to: stream, sessionID: 0)
+
+        let written = stream.allWrittenData
+        // The 0x41 signal value (65) exceeds the 1-byte QUIC-varint range, so it
+        // encodes as the 2-byte form 0x40 0x41. The decoded value — not the raw
+        // first byte — is the invariant: it must be 0x41, never a bare 0x00.
+        let (typeVarint, typeConsumed) = try Varint.decode(from: written)
+        XCTAssertEqual(typeVarint.value, 0x41, "session-0 bidi must lead with the 0x41 signal, not a bare 0x00")
+        let remaining = Data(written.dropFirst(typeConsumed))
+        let (sessionVarint, _) = try Varint.decode(from: remaining)
+        XCTAssertEqual(sessionVarint.value, 0)
     }
 
     func testWriteBidirectionalHeaderLargeSessionID() async throws {
@@ -731,8 +768,12 @@ final class WebTransportStreamFramingTests: XCTestCase {
         try await WebTransportStreamFraming.writeBidirectionalHeader(to: stream, sessionID: largeSessionID)
 
         let written = stream.allWrittenData
-        let (varint, _) = try Varint.decode(from: written)
-        XCTAssertEqual(varint.value, largeSessionID)
+        // 0x41 prefix, then the session ID.
+        let (typeVarint, typeConsumed) = try Varint.decode(from: written)
+        XCTAssertEqual(typeVarint.value, 0x41)
+        let remaining = Data(written.dropFirst(typeConsumed))
+        let (sessionVarint, _) = try Varint.decode(from: remaining)
+        XCTAssertEqual(sessionVarint.value, largeSessionID)
     }
 
     func testReadBidirectionalSessionID() throws {
@@ -1234,12 +1275,14 @@ final class WebTransportSessionStreamTests: XCTestCase {
         let count = await session.activeBidirectionalStreamCount
         XCTAssertEqual(count, 1)
 
-        // Verify session ID was written as the first varint on the stream
+        // Verify the bidi framing: 0x41 signal value first, then the session ID.
         let opened = mockConn.openedStreams
         XCTAssertEqual(opened.count, 1)
         let writtenData = opened[0].allWrittenData
-        let (varint, _) = try Varint.decode(from: writtenData)
-        XCTAssertEqual(varint.value, 0) // Session ID = 0
+        let (typeVarint, typeConsumed) = try Varint.decode(from: writtenData)
+        XCTAssertEqual(typeVarint.value, 0x41) // WEBTRANSPORT_STREAM bidi signal
+        let (sidVarint, _) = try Varint.decode(from: Data(writtenData.dropFirst(typeConsumed)))
+        XCTAssertEqual(sidVarint.value, 0) // Session ID = 0
 
         connectStream.enqueueFIN()
         mockConn.finish()
