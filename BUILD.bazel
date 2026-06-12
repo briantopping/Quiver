@@ -57,6 +57,7 @@ swift_library(
         "@swiftpkg_swift_asn1//:SwiftASN1",
         "@swiftpkg_swift_certificates//:X509",
         "@swiftpkg_swift_crypto//:Crypto",
+        "@swiftpkg_swift_crypto//:_CryptoExtras",
     ],
 )
 
