@@ -278,26 +278,23 @@ struct LossRecoveryInteropTests {
         #expect(stats.c2s > 0 && stats.s2c > 0, "the relay must have forwarded in both directions")
     }
 
-    // KNOWN BUG (found 2026-06-11 by this harness): at sustained loss ≳10% over a
-    // multi-packet stream, a STREAM frame can be dropped from ALL sender tracking
-    // (stream send-buffer + outbound queue + loss-detector) without ever being
-    // retransmitted. The sender then believes the transfer is complete
-    // (hasPendingStreamData=false, outboundQueue empty, loss-detector empty,
-    // congestion window open) while the receiver is permanently stuck at the
-    // offset of the lost frame — a reliability violation (a QUIC stream MUST
-    // complete under any <100% loss). Diagnosed to the loss-recovery/stream-send
-    // accounting, NOT the PTO-anchor or dedup work. Disabled (not deleted) so it
-    // is the RED gate for the fix: drop `.disabled` once the engine retransmits
-    // mid-stream loss correctly. Deterministic repro: seed 0x1 stalls at 2332/8000.
-    @Test("KNOWN BUG: 12% sustained loss permanently stalls a multi-packet stream",
-          .disabled("loss-recovery drops mid-stream frames from all sender tracking; see comment above"),
-          .timeLimit(.minutes(2)))
-    func sustainedLossAboveThresholdStalls() async throws {
-        let (matched, _) = try await runEcho(
+    // Regression for the ACK gap-decode off-by-one (LossDetector.computeAckIntervals
+    // used `gap + 1` vs RFC 9000 §19.3.1's `gap + 2`): under sustained mid-stream
+    // loss the sender SPURIOUSLY ACKed an unreceived (lost) packet — the first
+    // packet of each ACK gap — dropped it from tracking, and never retransmitted
+    // it, permanently stalling the stream. Before the fix this seed stalled at
+    // 2332/8000; it now round-trips an 8 KB multi-packet stream under heavy loss.
+    // Several seeds at 12%, each deterministic, exercise different gap patterns.
+    @Test("recovers an 8 KB stream under sustained 12% loss across seeds (gap-decode regression)",
+          .timeLimit(.minutes(2)),
+          arguments: [UInt64(0x1), 0x2, 0xA11CE, 0xC0FFEE])
+    func recoversUnderSustainedLoss(seed: UInt64) async throws {
+        let (matched, stats) = try await runEcho(
             lossProbability: 0.12,
-            seed: 0x1,
+            seed: seed,
             payloadBytes: 8000
         )
-        #expect(matched, "the full 8 KB stream must round-trip under 12% sustained loss")
+        #expect(matched, "the full 8 KB stream must round-trip under 12% sustained loss (seed \(seed))")
+        #expect(stats.dropped >= 1, "12% over a multi-packet echo must inject real loss (seed \(seed))")
     }
 }
